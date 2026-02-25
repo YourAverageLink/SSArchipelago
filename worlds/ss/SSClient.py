@@ -383,6 +383,8 @@ class SSContext(CommonContext):
         # It starts as `None` until it has been read from the server.
         self.visited_stage_names: Optional[set[str]] = None
 
+        self.len_item_buffer = 6 # length of the item ring buffer in-game
+
     async def disconnect(self, allow_autoreconnect: bool = False) -> None:
         """
         Disconnect the client from the server and reset game state variables.
@@ -835,13 +837,14 @@ class SSContext(CommonContext):
 
         # Read the item slot, and place the item here if the slot is empty.
         # When the game confirms the player received the item, it'll clear out this slot again.
-        slot = await self.read_byte(ARCHIPELAGO_ITEM_SLOT)
-        if slot == 0xFF:
-            # logger.info(f"DEBUG: Gave item {item_id} to player {ctx.player_names[ctx.slot]}.")
-            await self.write_byte(ARCHIPELAGO_ITEM_SLOT, item_id)
-            await asyncio.sleep(0.25)
-            await self.cache_link_data() # Recalculate State & Action
-            return True
+        slots = await self.read_bytes(ARCHIPELAGO_ITEM_SLOT, self.len_item_buffer)
+        for i, slot in enumerate(slots):
+            if slot == 0xFF:
+                # logger.info(f"DEBUG: Gave item {item_id} to player {ctx.player_names[ctx.slot]}.")
+                await self.write_byte(ARCHIPELAGO_ITEM_SLOT + i, item_id)
+                await asyncio.sleep(0.25)
+                await self.cache_link_data() # Recalculate State & Action
+                return True
 
         # If unable to give the item, return False
         return False
@@ -1102,7 +1105,7 @@ class SSContext(CommonContext):
         """
         if self.link_ptr == 0x0:
             return False
-        return self.link_action <= MAX_SAFE_ACTION
+        return self.link_action <= MAX_SAFE_ACTION or self.link_action == ITEM_GET_ACTION
 
     def is_link_not_in_action(self, actions: List[int]) -> bool:
         if self.link_ptr == 0x0:
