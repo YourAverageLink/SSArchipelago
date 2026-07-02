@@ -69,12 +69,13 @@ class AsyncUDPProtocol(asyncio.DatagramProtocol):
         self.client.established = False
 
 class CommandRequest:
-    def __init__(self, command: bytes, timeout: float = 10.0, retries: int = 2):
-        self.command = command
+    def __init__(self, payload: bytes, timeout: float = 10.0, retries: int = 2):
+        self.payload = payload
         self.timeout = timeout
         self.retries = retries
         self.future = asyncio.Future()
         self.timestamp = time.time()
+        self.seq: Optional[int] = None
 
 class AsyncWiiMemoryClient:
     def __init__(self, wii_ip, port=43673):
@@ -90,6 +91,8 @@ class AsyncWiiMemoryClient:
 
         # Queue for UDP queries to the wii
         self.command_queue: asyncio.Queue[CommandRequest] = asyncio.Queue()
+        self.pending_requests: dict[int, CommandRequest] = {}
+        self.next_seq: int = 0
         self.current_request: Optional[CommandRequest] = None
         self.queue_processor_task = None
         
@@ -128,6 +131,12 @@ class AsyncWiiMemoryClient:
                 await self.queue_processor_task
             except asyncio.CancelledError:
                 pass
+
+        for request in list(self.pending_requests.values()):
+            if not request.future.done():
+                request.future.set_exception(asyncio.CancelledError())
+        self.pending_requests.clear()
+        self.current_request = None
         
         if self.transport:
             self.transport.close()
@@ -136,23 +145,38 @@ class AsyncWiiMemoryClient:
 
     async def establish_connection(self, timeout=1):
         """Try to send a packet with IP and Port to establish connection to Wii server"""
-        command = b'\x00' + socket.inet_aton(self.my_ip) + struct.pack('>H', self.my_port)
+        payload = b'\x00' + socket.inet_aton(self.my_ip) + struct.pack('>H', self.my_port)
         
-        response = await self._send_command_queued(command, timeout)
+        response = await self._send_command_queued(payload, timeout)
         
         if len(response) > 0:
             return True
         else:
             raise Exception(f"Establishing UDP connection failed")
     
-    async def _send_command_queued(self, command: bytes, timeout=2, retries: Optional[int] = None) -> bytes:
+    async def _send_command_queued(self, payload: bytes, timeout=2, retries: Optional[int] = None) -> bytes:
         if retries is None:
             retries = self.retry_count
 
-        request = CommandRequest(command, timeout, retries)
+        request = CommandRequest(payload, timeout, retries)
         await self.command_queue.put(request)
         # once the command queue process this, return the result
         return await request.future
+
+    def _next_seq(self) -> int:
+        seq = self.next_seq
+        self.next_seq = (self.next_seq + 1) & 0xFFFF
+        return seq
+
+    def _build_packet(self, seq: int, payload: bytes) -> bytes:
+        packet = struct.pack('>H', seq) + payload
+        return packet
+
+    def _parse_response(self, data: bytes) -> tuple[int, bytes]:
+        if len(data) < 3:
+            raise ValueError(f"Response too short to contain sequence and payload ({len(data)} bytes)")
+        seq, = struct.unpack('>H', data[:2])
+        return seq, data[2:]
 
     async def _process_command_queue(self):
         while True:
@@ -161,13 +185,16 @@ class AsyncWiiMemoryClient:
                 if request.future.cancelled():
                     continue
 
+                request.seq = self._next_seq()
+                self.pending_requests[request.seq] = request
                 success = False
                 for attempt in range(request.retries + 1):
                     if request.future.cancelled():
                         break
 
                     self.current_request = request
-                    self.transport.sendto(request.command)
+                    packet = self._build_packet(request.seq, request.payload)
+                    self.transport.sendto(packet)
 
                     try:
                         # Wait for handle_response to fire
@@ -178,11 +205,17 @@ class AsyncWiiMemoryClient:
                         success = True
                         break
                     except asyncio.TimeoutError:
+                        if request.future.done():
+                            success = True
+                            break
                         self.current_request = None
                         if attempt < request.retries:
                             backoff = self.retry_backoff * (2 ** attempt)
                             print(f"Timeout attempt {attempt+1}, retrying in {backoff}s")
                             await asyncio.sleep(backoff)
+
+                self.pending_requests.pop(request.seq, None)
+                self.current_request = None
 
                 if not success and not request.future.done():
                     request.future.set_exception(asyncio.TimeoutError())
@@ -195,21 +228,25 @@ class AsyncWiiMemoryClient:
 
     def handle_response(self, data):
         """Handle incoming UDP response"""
-        if self.current_request and not self.current_request.future.done():
-            self.current_request.future.set_result(data)
-            self.current_request = None
+        try:
+            seq, payload = self._parse_response(data)
+        except ValueError:
+            print(f"Received malformed UDP response: {data}")
+            return
+
+        request = self.pending_requests.pop(seq, None)
+        if request is not None and not request.future.done():
+            request.future.set_result(payload)
+            if request is self.current_request:
+                self.current_request = None
         else:
-            print(f"Received unexpected response: {data}")
+            print(f"Received unexpected response seq={seq}: {payload}")
 
     async def read_bytes(self, address, length, timeout=2):
         """Read bytes from memory address"""
-        command = struct.pack('>BII', 0x01, address, length)  # READ - 0x01
-        # The wii will validate that this sum mod 256 is correct
-        checksum = sum(command) & 0xFF
-        command += checksum.to_bytes(1, 'big')
-        
-        response = await self._send_command_queued(command, timeout)
-        
+        payload = struct.pack('>BII', 0x01, address, length)  # READ - 0x01
+        response = await self._send_command_queued(payload, timeout)
+
         if len(response) == length:
             return response
         else:
@@ -217,13 +254,9 @@ class AsyncWiiMemoryClient:
     
     async def write_bytes(self, address, data, timeout=2):
         """Write bytes to memory address"""
-        command = struct.pack('>BII', 0x02, address, len(data)) + data  # WRITE - 0x02
-        # The wii will validate that this sum mod 256 is correct
-        checksum = sum(command) & 0xFF
-        command += checksum.to_bytes(1, 'big')
-        
-        response = await self._send_command_queued(command, timeout)
-        
+        payload = struct.pack('>BII', 0x02, address, len(data)) + data  # WRITE - 0x02
+        response = await self._send_command_queued(payload, timeout)
+
         if len(response) == 1:
             return True
         else:
@@ -231,9 +264,9 @@ class AsyncWiiMemoryClient:
     
     async def signal_dc(self, timeout=2) -> bytes:
         """Send a signal to the Wii that the client lost connection"""
-        command = struct.pack('>B', 0x05)  # DISCONNECT - 0x05
+        payload = struct.pack('>B', 0x05)  # DISCONNECT - 0x05
         
-        response = await self._send_command_queued(command, timeout)
+        response = await self._send_command_queued(payload, timeout)
         
         if len(response) > 0:
             return response
@@ -242,9 +275,9 @@ class AsyncWiiMemoryClient:
 
     async def req_slot_name(self, timeout=2) -> str:
         """Request the AP slot name from the Wii."""
-        command = struct.pack('>B', 0x06)
+        payload = struct.pack('>B', 0x06)
         
-        response = await self._send_command_queued(command, timeout)
+        response = await self._send_command_queued(payload, timeout)
         
         if len(response) > 0:
             slot_bytes = response.replace(b"\xFF", b"")
@@ -254,9 +287,9 @@ class AsyncWiiMemoryClient:
         
     async def req_status(self, timeout=2) -> APStatusReport:
         """Request some player status info from the Wii."""
-        command = struct.pack('>B', 0x07)
+        payload = struct.pack('>B', 0x07)
         
-        response = await self._send_command_queued(command, timeout)
+        response = await self._send_command_queued(payload, timeout)
         
         if len(response) > 0:
             return APStatusReport.from_bytes(response)
@@ -265,9 +298,9 @@ class AsyncWiiMemoryClient:
     
     async def give_item(self, item_id, timeout=2) -> APStatusReport:
         """(Try to) tell the Wii to give the player an item (& recv new status report)."""
-        command = struct.pack('>BB', 0x08, item_id)
+        payload = struct.pack('>BB', 0x08, item_id)
         
-        response = await self._send_command_queued(command, timeout)
+        response = await self._send_command_queued(payload, timeout)
         
         if len(response) > 0:
             return APStatusReport.from_bytes(response)
@@ -276,36 +309,36 @@ class AsyncWiiMemoryClient:
     
     async def kill_link(self, timeout=2) -> bool:
         """Tell the Wii that it should kill Link."""
-        command = struct.pack('>B', 0x09)
+        payload = struct.pack('>B', 0x09)
         
-        response = await self._send_command_queued(command, timeout)
+        response = await self._send_command_queued(payload, timeout)
         
         if len(response) > 0:
-            return response[0] == b'\x01'
+            return response[0] == 1
         else:
             raise Exception(f"Kill Link failed.")
     
     async def deplete_stamina(self, timeout=2) -> bool:
         """Tell the Wii that it should deplete Link's stamina."""
-        command = struct.pack('>B', 0x0a)
+        payload = struct.pack('>B', 0x0a)
         
-        response = await self._send_command_queued(command, timeout)
+        response = await self._send_command_queued(payload, timeout)
         
         if len(response) > 0:
-            return response[0] == b'\x01'
+            return response[0] == 1
         else:
             raise Exception(f"Deplete stamina failed.")
     
     async def write_to_text_buffer(self, text: bytes, timeout=2) -> bool:
-        """Tell the Wii that it should kill Link."""
-        command = struct.pack('>B', 0x0b) + text #.encode()
+        """Write a text buffer to the Wii."""
+        payload = struct.pack('>B', 0x0b) + text
         
-        response = await self._send_command_queued(command, timeout)
+        response = await self._send_command_queued(payload, timeout)
         
         if len(response) > 0:
-            return response[0] == b'\x0b'
+            return response[0] == 0x0b
         else:
-            raise Exception(f"Deplete stamina failed.")
+            raise Exception(f"Write to text buffer failed.")
     
     def close(self):
         """Close connection"""
