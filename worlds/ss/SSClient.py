@@ -363,6 +363,7 @@ class BatchFlagHandler:
             self.flags[offset + 2] << 8 + \
             self.flags[offset + 1] << 16 + \
             self.flags[offset] << 24
+
 class SSIngameJSONParser(JSONtoTextParser):
     def _handle_color(self, node):
         codes = node["color"].split(";")
@@ -381,20 +382,10 @@ class SSCommandProcessor(ClientCommandProcessor):
         :param ctx: Context for the client.
         """
         super().__init__(ctx)
-
-    def _cmd_dolphin(self) -> None:
-        """
-        Switch to Dolphin mode and display the current Dolphin emulator connection status.
-        """
-        if isinstance(self.ctx, SSContext):
-            logger.info(f"Dolphin Status: {self.ctx.dolphin_status}")
-            if self.ctx.is_hooked() and self.ctx.on_console:
-                self.ctx.wii_memory_client.close()
-            self.ctx.on_console = False
     
     def _cmd_console(self, ip_addr: str) -> None:
         """
-        Switch to console mode, connecting to a UDP server on a Wii (must be on the same network)
+        Connect to a console, using the IP address shown in-game (must be on the same network).
         """
         if isinstance(self.ctx, SSContext):
             logger.info(f"Starting up a Wii client...")
@@ -421,21 +412,13 @@ class SSCommandProcessor(ClientCommandProcessor):
             else:
                 Utils.async_start(self.ctx.update_breath_link(True))
                 logger.info("Breathlink enabled.")
-    
-    def _cmd_status(self) -> None:
-        """
-        Switch to console mode, connecting to a UDP server on a Wii (must be on the same network)
-        """
-        if isinstance(self.ctx, SSContext):
-            status = self.ctx.status_report
-            logger.info(f"Player Status:\nStage: {status.stage_name}\nDead: {status.is_dead}\nTitle: {status.is_on_title_screen}Last Recv: {status.last_received_item}\nLink Exists: {status.link_exists}")
 
 
 class SSContext(CommonContext):
     """
     The context for the SS client.
 
-    Manages the connection between the server and the emulator.
+    Manages the connection between the server and the game.
     """
 
     command_processor = SSCommandProcessor
@@ -445,7 +428,7 @@ class SSContext(CommonContext):
     def __init__(self, server_address: Optional[str], password: Optional[str]) -> None:
         """
         Initialize the SS context.
-
+~
         :param server_address: Address of the Archipelago server.
         :param password: Password for server authentication.
         """
@@ -453,7 +436,6 @@ class SSContext(CommonContext):
         super().__init__(server_address, password)
         self.items_rcvd: list[tuple[NetworkItem, int]] = []
         self.sync_task: Optional[asyncio.Task[None]] = None
-        self.dolphin_status: str = CONNECTION_INITIAL_STATUS
         self.awaiting_rom: bool = False
         self.last_rcvd_index: int = -1
         self.has_send_death: bool = False
@@ -469,7 +451,7 @@ class SSContext(CommonContext):
         self.ingame_client_messages: list[tuple[float, str]] = []
         self.on_console: bool = True
         self.wii_memory_client: AsyncWiiMemoryClient = None
-        self.wii_ip: str = "0.0.0.0"
+        self.wii_ip: str = "127.0.0.1"
         self.socket = None # Server socket
         self.client_socket = None # Connection from Wii
         self.ingame_json_parser = SSIngameJSONParser(self)
@@ -989,13 +971,13 @@ class SSContext(CommonContext):
 
 async def do_sync_task(ctx: SSContext) -> None:
     """
-    Manages the connection to Dolphin or the game.
+    Manages the connection to the game.
 
-    While connected, read the emulator's memory to look for any relevant changes made by the player in the game.
+    While connected, send some commands over the socket to the console to look for any relevant changes made by the player in the game.
 
     :param ctx: The SS client context.
     """
-    logger.info("Connecting to Dolphin. Use /dolphin for status information.")
+    logger.info("Attempting to connect to localhost; if you're on Dolphin this should connect you, otherwise, type /console (ip address shown in-game) to continue.")
     while not ctx.exit_event.is_set():
         try:
             if ctx.is_hooked():
