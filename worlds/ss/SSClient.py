@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 class APStatusReport:
     def __init__(self, stage_name: bytes = b'', last_received_item: int = 0, link_exists: bool = False,
                  is_on_title_screen: bool = False, is_dead: bool = False, is_out_of_stamina: bool = False):
-        self.stage_name = (stage_name if len(stage_name) == 16 else stage_name.ljust(16, b'\x00')[:16]).decode()
+        self.stage_name = (stage_name if len(stage_name) == 16 else stage_name.ljust(16, b'\x00')[:16])
         self.last_received_item = last_received_item
         self.link_exists = link_exists
         self.is_on_title_screen = is_on_title_screen
@@ -390,7 +390,6 @@ class SSCommandProcessor(ClientCommandProcessor):
         if isinstance(self.ctx, SSContext):
             logger.info(f"Starting up a Wii client...")
             self.ctx.wii_ip = ip_addr
-            self.ctx.on_console = True
             self.ctx.start_wii_client(ip_addr)
             
     def _cmd_deathlink(self) -> None:
@@ -449,7 +448,6 @@ class SSContext(CommonContext):
         self.cubes_checked = set() #local variable
         
         self.ingame_client_messages: list[tuple[float, str]] = []
-        self.on_console: bool = True
         self.wii_memory_client: AsyncWiiMemoryClient = None
         self.wii_ip: str = "127.0.0.1"
         self.socket = None # Server socket
@@ -779,12 +777,11 @@ class SSContext(CommonContext):
             for item, idx in self.items_rcvd:
                 # If the item's index is greater than the player's expected index, give the player the item.
                 if self.status_report.last_received_item <= idx:
-                    # Attempt to give the item and increment the expected index.
-                    while not await self._give_item(LOOKUP_ID_TO_NAME[item.item]):
-                        await asyncio.sleep(0.25)
-                        # await self.cache_status()
-
-
+                    # Attempt to give the item and increment the expected index
+                    # if we can't receive items right now, just return and move on so the rest of the process
+                    # doesn't get stuck
+                    if not await self._give_item(LOOKUP_ID_TO_NAME[item.item]):
+                        return
 
     async def check_locations(self) -> None:
         """
@@ -883,7 +880,7 @@ class SSContext(CommonContext):
 
         :param ctx: The SS client context.
         """
-        new_stage_name = self.status_report.stage_name
+        new_stage_name = self.status_report.stage_name.decode('utf-8').rstrip("\x00")
 
         current_stage_name = self.current_stage_name
 
