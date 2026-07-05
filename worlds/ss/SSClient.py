@@ -10,8 +10,6 @@ import threading
 from typing import TYPE_CHECKING, Any, List, Optional
 import typing
 
-import dolphin_memory_engine
-
 import Utils
 from CommonClient import (
     ClientCommandProcessor,
@@ -241,30 +239,32 @@ class AsyncWiiMemoryClient:
                 self.current_request = None
         else:
             print(f"Received unexpected response seq={seq}: {payload}")
-
-    async def read_bytes(self, address, length, timeout=2):
-        """Read bytes from memory address"""
-        payload = struct.pack('>BII', 0x01, address, length)  # READ - 0x01
+    
+    async def req_scene_flags(self, timeout=2) -> bytes:
+        """Request the scene flag array from the Wii."""
+        payload = struct.pack('>B', 0x03)
+        
         response = await self._send_command_queued(payload, timeout)
-
-        if len(response) == length:
+        
+        if len(response) == 416:
             return response
         else:
-            raise Exception(f"Read failed at address 0x{address:08x}")
+            raise Exception(f"Reading scene flags failed.")
     
-    async def write_bytes(self, address, data, timeout=2):
-        """Write bytes to memory address"""
-        payload = struct.pack('>BII', 0x02, address, len(data)) + data  # WRITE - 0x02
+    async def req_story_flags(self, timeout=2) -> bytes:
+        """Request the story flag array from the Wii."""
+        payload = struct.pack('>B', 0x04)
+        
         response = await self._send_command_queued(payload, timeout)
-
-        if len(response) == 1:
-            return True
+        
+        if len(response) == 256:
+            return response
         else:
-            raise Exception(f"Write failed at address 0x{address:08x}")
+            raise Exception(f"Reading story flags failed.")
     
     async def signal_dc(self, timeout=2) -> bytes:
         """Send a signal to the Wii that the client lost connection"""
-        payload = struct.pack('>B', 0x05)  # DISCONNECT - 0x05
+        payload = struct.pack('>B', 0x05)
         
         response = await self._send_command_queued(payload, timeout)
         
@@ -330,7 +330,7 @@ class AsyncWiiMemoryClient:
             raise Exception(f"Deplete stamina failed.")
     
     async def write_to_text_buffer(self, text: bytes, timeout=2) -> bool:
-        """Write a text buffer to the Wii."""
+        """Write to the in-game text buffer on the Wii."""
         payload = struct.pack('>B', 0x0b) + text
         
         response = await self._send_command_queued(payload, timeout)
@@ -356,6 +356,13 @@ class BatchFlagHandler:
         assert(offset >= 0)
         return self.flags[offset]
 
+    def lookup_long(self, addr: int) -> int:
+        offset = addr - self.base_addr
+        assert(offset >= 0)
+        return self.flags[offset + 3] + \
+            self.flags[offset + 2] << 8 + \
+            self.flags[offset + 1] << 16 + \
+            self.flags[offset] << 24
 class SSIngameJSONParser(JSONtoTextParser):
     def _handle_color(self, node):
         codes = node["color"].split(";")
@@ -392,10 +399,6 @@ class SSCommandProcessor(ClientCommandProcessor):
         if isinstance(self.ctx, SSContext):
             logger.info(f"Starting up a Wii client...")
             self.ctx.wii_ip = ip_addr
-            if self.ctx.is_hooked() and not self.ctx.on_console:
-                # Re-display network info again (for testing things on dolphin)
-                dolphin_memory_engine.write_bytes(NETWORK_USAGE_BOOL, b'\x01')
-                dolphin_memory_engine.un_hook()
             self.ctx.on_console = True
             self.ctx.start_wii_client(ip_addr)
             
@@ -658,7 +661,7 @@ class SSContext(CommonContext):
         lines = []
         for raw_line in msg.split("\n"):
             lines.extend(
-                textwrap.wrap(
+                wrap_console_text(
                     raw_line,
                     INGAME_LINE_LENGTH,
                 )
@@ -703,14 +706,7 @@ class SSContext(CommonContext):
         super().on_print_json(args)
     
     async def write_string_to_buffer(self, text: str):
-        # Truncate text to fit in the buffer, then write to buffer
-        text_bytes = text.encode("utf-8")
-        if len(text_bytes) >= CLIENT_TEXT_BUFFER_SIZE:
-            for i in range(CLIENT_TEXT_BUFFER_SIZE - 7, CLIENT_TEXT_BUFFER_SIZE + 1):
-                if text_bytes[i] == 0x0e: # color control sequence, don't want to truncate!
-                    break
-            text_bytes = text_bytes[: i - 1]
-        
+        text_bytes = truncate_console_text(text, CLIENT_TEXT_BUFFER_SIZE)
         await self.wii_memory_client.write_to_text_buffer(text_bytes.ljust(CLIENT_TEXT_BUFFER_SIZE, b'\x00'))
         self.is_text_buffer_empty = False
     
@@ -728,164 +724,16 @@ class SSContext(CommonContext):
             self.wii_memory_client.close()
         self.wii_memory_client = AsyncWiiMemoryClient(ip)
     
-    def close_wii_client(self):
+    async def close_wii_client(self):
         """Close Wii client connection"""
         if self.wii_memory_client:
-            if self.wii_memory_client.established:
-                self.wii_memory_client.signal_dc()
+            # if self.wii_memory_client.established:
+            #    await self.wii_memory_client.signal_dc()
             self.wii_memory_client.close()
             self.wii_memory_client = None
     
     def is_hooked(self):
-        if self.on_console:
-            return self.wii_memory_client and self.wii_memory_client.established
-        
-        return dolphin_memory_engine.is_hooked() and self.dolphin_status == CONNECTION_CONNECTED_STATUS
-
-    async def read_bytes(self, console_address: int, num_bytes: int) -> bytes:
-        """
-        Read bytes from the game's memory
-
-        :param console_address: Address to read from.
-        :return: The value read from memory.
-        """
-        if self.on_console:
-            return await self.wii_memory_client.read_bytes(console_address, num_bytes)
-
-        return dolphin_memory_engine.read_bytes(console_address, num_bytes)
-    
-    async def write_bytes(self, console_address: int, to_write: bytes):
-        """
-        Write bytes to the game's memory
-
-        :param console_address: Address to write to.
-        :param to_write: Bytes to write
-        """
-        if self.on_console:
-            await self.wii_memory_client.write_bytes(console_address, to_write)
-            return
-            
-        dolphin_memory_engine.write_bytes(console_address, to_write)
-
-    async def read_byte(self, console_address: int) -> int:
-        """
-        Read 1 byte from the game's memory
-
-        :param console_address: Address to read from.
-        :return: The value read from memory.
-        """
-        bytes = await self.read_bytes(console_address, 1)
-        return int.from_bytes(bytes, byteorder='big')
-
-    async def read_short(self, console_address: int) -> int:
-        """
-        Read a 2-byte short from the game's memory
-
-        :param console_address: Address to read from.
-        :return: The value read from memory.
-        """
-        bytes = await self.read_bytes(console_address, 2)
-        return int.from_bytes(bytes, byteorder='big')
-
-    async def read_long(self, console_address: int) -> int:
-        """
-        Read a 4-byte long from the game's memory
-
-        :param console_address: Address to read from.
-        :return: The value read from memory.
-        """
-        bytes = await self.read_bytes(console_address, 4)
-        return int.from_bytes(bytes, byteorder='big')
-    
-    async def write_byte(self, console_address: int, value: int) -> None:
-        """
-        Write a byte to the game's memory
-
-        :param console_address: Address to write to.
-        :param value: Value to write.
-        """
-        await self.write_bytes(
-            console_address, value.to_bytes(1, byteorder="big")
-        )
-    
-    async def write_short(self, console_address: int, value: int) -> None:
-        """
-        Write a 2-byte short to the game's memory
-
-        :param console_address: Address to write to.
-        :param value: Value to write.
-        """
-        await self.write_bytes(
-            console_address, value.to_bytes(2, byteorder="big")
-        )
-    
-    async def write_long(self, console_address: int, value: int) -> None:
-        """
-        Write a 4-byte long to the game's memory
-
-        :param console_address: Address to write to.
-        :param value: Value to write.
-        """
-        await self.write_bytes(
-            console_address, value.to_bytes(4, byteorder="big")
-        )
-    
-    async def read_string(self, console_address: int, strlen: int) -> str:
-        """
-        Read a string from the game's memory.
-
-        :param console_address: Address to start reading from.
-        :param strlen: Length of the string to read.
-        :return: The string.
-        """
-        strbytes = await self.read_bytes(console_address, strlen)
-        return (
-            strbytes
-            .split(b"\0", 1)[0]
-            .decode()
-        )
-    
-    async def read_slot(self) -> str:
-        """
-        Read the slot name from the game's memory
-        Slot name is 16 bytes, offset 20 bytes from the AP array.
-        Slot name is encoded in UTF-8.
-
-        :return: The string containing the slot name.
-        """
-        x = await self.wii_memory_client.req_slot_name()
-        print(f"HEY THIS IS THE SLOT: {x}, LENGTH {len(x)}")
-        return x
-
-    async def read_scene_flags(self) -> bytes:
-        """
-        Read bytes from the game's memory
-
-        :param console_address: Address to read from.
-        :return: The value read from memory.
-        """
-        if self.on_console:
-            res_bytes = bytes()
-            for i in range(13):
-                res_bytes += await self.wii_memory_client.read_bytes(SCENEFLAG_START_ADDR + 32 * i, 32)
-            return res_bytes
-
-        return dolphin_memory_engine.read_bytes(SCENEFLAG_START_ADDR, 416)
-
-    async def read_story_flags(self) -> bytes:
-        """
-        Read bytes from the game's memory
-
-        :param console_address: Address to read from.
-        :return: The value read from memory.
-        """
-        if self.on_console:
-            res_bytes = bytes()
-            for i in range(8):
-                res_bytes += await self.wii_memory_client.read_bytes(STORYFLAG_START_ADDR + 32 * i, 32)
-            return res_bytes
-
-        return dolphin_memory_engine.read_bytes(STORYFLAG_START_ADDR, 256)
+        return self.wii_memory_client and self.wii_memory_client.established
 
     async def _give_death(self) -> None:
         """
@@ -924,7 +772,6 @@ class SSContext(CommonContext):
         if not self.can_receive_items():
             return False
         
-        print("Try to give it!")
         curr_expected = self.status_report.last_received_item
 
         item_id = ITEM_TABLE[item_name].item_id  # In game item ID
@@ -944,7 +791,7 @@ class SSContext(CommonContext):
         :param ctx: The SS client context.
         """
         if self.can_receive_items():
-            # Read the expected index of the player, which is the index of the latest item they've received.=
+            # Read the expected index of the player, which is the index of the latest item they've received.
 
             # Loop through items to give.
             for item, idx in self.items_rcvd:
@@ -955,8 +802,6 @@ class SSContext(CommonContext):
                         await asyncio.sleep(0.25)
                         # await self.cache_status()
 
-                    # Increment the expected index.
-                    # await self.write_short(EXPECTED_INDEX_ADDR, idx + 1)
 
 
     async def check_locations(self) -> None:
@@ -970,8 +815,8 @@ class SSContext(CommonContext):
         """
         # Don't send locations from the title screen (BiT)
         if self.can_send_items():
-            storyflags = BatchFlagHandler(await self.read_story_flags(), STORYFLAG_START_ADDR)
-            sceneflags = BatchFlagHandler(await self.read_scene_flags(), SCENEFLAG_START_ADDR)
+            storyflags = BatchFlagHandler(await self.wii_memory_client.req_story_flags(), STORYFLAG_START_ADDR)
+            sceneflags = BatchFlagHandler(await self.wii_memory_client.req_scene_flags(), SCENEFLAG_START_ADDR)
             # Loop through all locations to see if each has been checked.
             for location, data in LOCATION_TABLE.items():
                 checked = False
@@ -984,12 +829,12 @@ class SSContext(CommonContext):
                     checked = bool(flag & flag_value)
                 elif flag_type == SSLocCheckedFlag.SPECL:
                     if location == "Upper Skyloft - Ghost/Pipit's Crystals":
-                        byte = await self.read_byte(0x805A9B16)
+                        byte = storyflags.lookup_byte(0x805A9B16)
                         flag1 = bool(byte & 0x80)  # 5 crystals from Pipit
                         flag2 = bool(byte & 0x04)  # 5 crystals from Ghost
                         checked = flag1 or flag2
                     if location == "Central Skyloft - Peater/Peatrice's Crystals":
-                        bytelong = await self.read_long(0x805A9B1A)
+                        bytelong = storyflags.lookup_long(0x805A9B1A)
                         flag1 = bool(
                             bytelong & 0x40000000
                         )  # 5 crystals from Peatrice
@@ -1091,16 +936,6 @@ class SSContext(CommonContext):
         
         await self.send_msgs([{"cmd": "LocationScouts", "locations": locs_to_scout, "create_as_hint": 2}]) 
 
-    async def check_alive(self) -> bool:
-        """
-        Check if the player is currently alive in-game.
-
-        :return: `True` if the player is alive, otherwise `False`.
-        """
-        cur_health = await self.read_short(CURR_HEALTH_ADDR)
-        return cur_health > 0
-
-
     async def check_death(self) -> None:
         """
         Check if the player is currently dead in-game.
@@ -1130,34 +965,9 @@ class SSContext(CommonContext):
                     await self.send_breath(self.player_names[self.slot] + " ran out of stamina.")
             else:
                 self.has_send_breath = False
-
-    async def check_on_title_screen(self) -> bool:
-        """
-        Check if the player is on the Title Screen.
-        
-        :return: `True` if the player is on the title screen, otherwise `False`.
-        """
-        return await self.read_byte(GLOBAL_TITLE_LOADER_ADDR) != 0x0
-
-    async def check_in_minigame(self) -> bool:
-        """
-        Check if the player is in a minigame.
-        
-        :return: `True` if the player is in a minigame, false if not.
-        """
-        return await self.read_byte(MINIGAME_STATE_ADDR) == 0x0
     
     async def cache_status(self):
         self.status_report = await self.wii_memory_client.req_status()
-
-    async def check_on_file_1(self) -> bool:
-        """
-        Returns a bool determining if the player is currently on File 1.
-
-        :return: True if File 1 last selected, False otherwise
-        """
-        file = await self.read_byte(SELECTED_FILE_ADDR)
-        return file == 0x0
 
     def can_receive_items(self) -> bool:
         """
@@ -1205,13 +1015,13 @@ async def do_sync_task(ctx: SSContext) -> None:
                     await ctx.check_current_stage_changed()
                 else:
                     if not ctx.auth:
-                        ctx.auth = await ctx.read_slot()
+                        ctx.auth = await ctx.wii_memory_client.req_slot_name()
                     if ctx.awaiting_rom:
                         await ctx.server_auth()
                 await asyncio.sleep(0.1)
             else:
                 logger.info("Attempting to connect to the console...")
-                ctx.close_wii_client()
+                await ctx.close_wii_client()
                 ctx.start_wii_client(ctx.wii_ip)
                 await ctx.wii_memory_client.connect()
 
@@ -1227,7 +1037,7 @@ async def do_sync_task(ctx: SSContext) -> None:
                     continue
         except TimeoutError:
             print("Lost packet from console, attempting to reconnect...")
-            ctx.close_wii_client()
+            await ctx.close_wii_client()
             ctx.start_wii_client(ctx.wii_ip)
             if not await ctx.wii_memory_client.connect():
                 logger.info("Lost packet from console and couldn't reconnect. Attempting again in 5 seconds...")
@@ -1236,7 +1046,7 @@ async def do_sync_task(ctx: SSContext) -> None:
                 print("Reconnected successfully.")
             continue
         except Exception:
-            ctx.close_wii_client()
+            await ctx.close_wii_client()
             logger.info(
                 "Connection to console failed, attempting again in 5 seconds..."
             )
