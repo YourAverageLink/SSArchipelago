@@ -427,7 +427,7 @@ class SSContext(CommonContext):
     def __init__(self, server_address: Optional[str], password: Optional[str]) -> None:
         """
         Initialize the SS context.
-~
+
         :param server_address: Address of the Archipelago server.
         :param password: Password for server authentication.
         """
