@@ -27,6 +27,8 @@ from .Hints import HINT_TABLE, SSHint
 from .Cubes import cubes_table
 from .SSClientUtils import *
 
+LOCALHOST_IP = "127.0.0.1"
+
 if TYPE_CHECKING:
     import kvui
 
@@ -390,7 +392,18 @@ class SSCommandProcessor(ClientCommandProcessor):
         if isinstance(self.ctx, SSContext):
             logger.info(f"Starting up a Wii client...")
             self.ctx.wii_ip = ip_addr
+            self.ctx.store_ip_in_cache()
             self.ctx.start_wii_client(ip_addr)
+    
+    def _cmd_emulator(self) -> None:
+        """
+        Alias for /console 127.0.0.1; connects to localhost.
+        """
+        if isinstance(self.ctx, SSContext):
+            logger.info(f"Starting up a Wii client...")
+            self.ctx.wii_ip = LOCALHOST_IP
+            self.ctx.store_ip_in_cache()
+            self.ctx.start_wii_client(LOCALHOST_IP)
             
     def _cmd_deathlink(self) -> None:
         """Toggle DeathLink."""
@@ -449,7 +462,7 @@ class SSContext(CommonContext):
         
         self.ingame_client_messages: list[tuple[float, str]] = []
         self.wii_memory_client: AsyncWiiMemoryClient = None
-        self.wii_ip: str = "127.0.0.1"
+        self.wii_ip: str = self.load_ip_from_cache()
         self.socket = None # Server socket
         self.client_socket = None # Connection from Wii
         self.ingame_json_parser = SSIngameJSONParser(self)
@@ -687,7 +700,7 @@ class SSContext(CommonContext):
     
     async def write_string_to_buffer(self, text: str):
         text_bytes = truncate_console_text(text, CLIENT_TEXT_BUFFER_SIZE)
-        await self.wii_memory_client.write_to_text_buffer(text_bytes.ljust(CLIENT_TEXT_BUFFER_SIZE, b'\x00'))
+        await self.wii_memory_client.write_to_text_buffer(text_bytes + b'\x00')
         self.is_text_buffer_empty = False
     
     async def clear_buffer(self):
@@ -964,6 +977,21 @@ class SSContext(CommonContext):
         """
         return not self.status_report.is_on_title_screen
 
+    def store_ip_in_cache(self):
+        current_cache = Utils.persistent_load().get("groups_by_checksum", {}).get(self.checksums[self.game], {})
+        ip_entry = {"console_ip_address": self.wii_ip}
+        if self.game in current_cache:
+            current_cache[self.game].update(ip_entry)
+        else:
+            current_cache[self.game] = ip_entry
+        Utils.persistent_store("groups_by_checksum", self.checksums[self.game], current_cache, True)
+
+    def load_ip_from_cache(self) -> str:
+        current_cache = Utils.persistent_load().get("groups_by_checksum", {}).get(self.checksums[self.game], {})
+        if self.game in current_cache:
+            return current_cache[self.game].get("console_ip_address", LOCALHOST_IP)
+        else:
+            return LOCALHOST_IP
 
 
 async def do_sync_task(ctx: SSContext) -> None:
@@ -974,14 +1002,17 @@ async def do_sync_task(ctx: SSContext) -> None:
 
     :param ctx: The SS client context.
     """
-    logger.info("Attempting to connect to localhost; if you're on Dolphin this should connect you, otherwise, type /console (ip address shown in-game) to continue.")
+    if ctx.wii_ip == LOCALHOST_IP:
+        logger.info("Attempting to connect to localhost; if you're on an emulator this should connect you, otherwise, type /console (IP address shown in-game) to continue.")
+    else:
+        logger.info(f"Attempting to connect to the console (using last used IP address {ctx.wii_ip}); if your console's IP address has changed, type /console (new IP address shown in-game) to continue.")
     while not ctx.exit_event.is_set():
         try:
             if ctx.is_hooked():
-                await ctx.cache_status()
                 await ctx.show_messages_ingame()
                 
                 if ctx.slot is not None:
+                    await ctx.cache_status()
                     if not ctx.status_report.link_exists:
                         await asyncio.sleep(0.1)
                         continue
