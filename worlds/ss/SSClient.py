@@ -963,7 +963,7 @@ class SSContext(CommonContext):
 
     def can_receive_items(self) -> bool:
         """
-        Link must be on File 1 in a valid state and action and not on the title screen to receive items.
+        Link must meet all the item sending conditions, and be alive, to receive items.
         """
 
         return (
