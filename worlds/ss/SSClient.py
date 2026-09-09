@@ -1,6 +1,7 @@
 import asyncio
 import copy
 from dataclasses import dataclass
+from enum import IntEnum
 import time
 import traceback
 import textwrap
@@ -28,6 +29,13 @@ from .Cubes import cubes_table
 from .SSClientUtils import *
 
 LOCALHOST_IP = "127.0.0.1"
+
+class VerbosityLevel(IntEnum):
+    Nothing = 0
+    Items = 1
+    ItemsChat = 2
+    ItemsChatJoins = 3
+    All = 4
 
 if TYPE_CHECKING:
     import kvui
@@ -361,10 +369,10 @@ class BatchFlagHandler:
     def lookup_long(self, addr: int) -> int:
         offset = addr - self.base_addr
         assert(offset >= 0)
-        return self.flags[offset + 3] + \
-            self.flags[offset + 2] << 8 + \
-            self.flags[offset + 1] << 16 + \
-            self.flags[offset] << 24
+        return (self.flags[offset + 3]) + \
+            (self.flags[offset + 2] << 8) + \
+            (self.flags[offset + 1] << 16) + \
+            (self.flags[offset] << 24)
 
 class SSIngameJSONParser(JSONtoTextParser):
     def _handle_color(self, node):
@@ -425,6 +433,49 @@ class SSCommandProcessor(ClientCommandProcessor):
                 Utils.async_start(self.ctx.update_breath_link(True))
                 logger.info("Breathlink enabled.")
 
+    def _cmd_msg_forwarding(self, verbosity_level: str) -> None:
+        """
+        Specify what kinds of messages should be displayed in-game.
+        None - No client messages
+        Low - Items sent to/received from this slot
+        Medium - Chat messages & items sent to/received from this slot
+        High - Chat messages, items sent to/received from this slot, & players joining/leaving
+        All - All client messages
+        """
+        if isinstance(self.ctx, SSContext):
+            lvl = verbosity_level.strip().lower()
+            verbosity = None
+            if lvl == "none":
+                verbosity = VerbosityLevel.Nothing
+                logger.info("No client messages will appear in-game.")
+            elif lvl == "low":
+                verbosity = VerbosityLevel.Items
+                logger.info("Items sent to/received from this slot will appear in-game.")
+            elif lvl == "medium":
+                verbosity = VerbosityLevel.ItemsChat
+                logger.info("Chat messages & items sent to/received from this slot will appear in-game.")
+            elif lvl == "high":
+                verbosity = VerbosityLevel.ItemsChatJoins
+                logger.info("Chat messages, items sent to/received from this slot, & players joining/leaving will appear in-game.")
+            elif lvl == "all":
+                verbosity = VerbosityLevel.All
+                logger.info("All client messages will appear in-game.")
+
+            if verbosity is None:
+                logger.error("Error - Please select a verbosity level: none, low, medium, high, or all.")
+            else:
+                self.ctx.ingame_verbosity = verbosity
+                self.ctx.store_message_level_in_cache()
+
+    def _cmd_clear_msgs(self) -> None:
+        """
+        Clears out the in-game client message buffer. Might be useful in case of a release that causes a lot of text to block the screen.
+        """
+        if isinstance(self.ctx, SSContext):
+            self.ctx.ingame_client_messages.clear()
+            self.ctx.clear_buffer()
+            logger.info("Cleared out the in-game message buffer.")
+
 
 class SSContext(CommonContext):
     """
@@ -461,6 +512,7 @@ class SSContext(CommonContext):
         self.cubes_checked = set() #local variable
         
         self.ingame_client_messages: list[tuple[float, str]] = []
+        self.ingame_verbosity: VerbosityLevel = self.load_message_level_from_cache() # what kind of messages to forward to the game
         self.wii_memory_client: AsyncWiiMemoryClient = None
         self.wii_ip: str = self.load_ip_from_cache()
         self.socket = None # Server socket
@@ -690,11 +742,21 @@ class SSContext(CommonContext):
             await self.write_string_to_buffer("\n".join(line_list[:16]))
 
     def on_print_json(self, args: dict):
-        # Don't show messages in-game for item sends irrelevant to this slot
-        if not self.is_uninteresting_item_send(args):
-            self.forward_client_message(
-                self.ingame_json_parser(copy.deepcopy(args["data"]))
-            )
+        should_forward = self.ingame_verbosity == VerbosityLevel.All
+        if self.ingame_verbosity == VerbosityLevel.ItemsChatJoins and \
+            not self.is_uninteresting_item_send(args):
+            should_forward = True
+        if self.ingame_verbosity == VerbosityLevel.ItemsChat and \
+            not self.is_uninteresting_item_send(args) and \
+            not self.is_connection_change(args):
+            should_forward = True
+        if self.ingame_verbosity == VerbosityLevel.Items and \
+            not self.is_uninteresting_item_send(args) and \
+            args.get("type", "") == "ItemSend":
+            should_forward = True
+
+        if should_forward:
+            self.forward_client_message(self.ingame_json_parser(copy.deepcopy(args["data"])))       
 
         super().on_print_json(args)
     
@@ -893,7 +955,7 @@ class SSContext(CommonContext):
 
         :param ctx: The SS client context.
         """
-        new_stage_name = self.status_report.stage_name.decode('utf-8').rstrip("\x00")
+        new_stage_name = self.status_report.stage_name.split(b'\x00')[0].decode('utf-8')
 
         current_stage_name = self.current_stage_name
 
@@ -993,6 +1055,21 @@ class SSContext(CommonContext):
         else:
             return LOCALHOST_IP
 
+    def store_message_level_in_cache(self):
+            current_cache = Utils.persistent_load().get("groups_by_checksum", {}).get(self.checksums[self.game], {})
+            verbosity = {"message_verbosity": self.ingame_verbosity}
+            if self.game in current_cache:
+                current_cache[self.game].update(verbosity)
+            else:
+                current_cache[self.game] = verbosity
+            Utils.persistent_store("groups_by_checksum", self.checksums[self.game], current_cache, True)
+    
+    def load_message_level_from_cache(self) -> VerbosityLevel:
+        current_cache = Utils.persistent_load().get("groups_by_checksum", {}).get(self.checksums[self.game], {})
+        if self.game in current_cache:
+            return current_cache[self.game].get("message_verbosity", VerbosityLevel.Nothing)
+        else:
+            return VerbosityLevel.ItemsChatJoins # this was the old verbosity level
 
 async def do_sync_task(ctx: SSContext) -> None:
     """
@@ -1006,6 +1083,19 @@ async def do_sync_task(ctx: SSContext) -> None:
         logger.info("Attempting to connect to localhost; if you're on an emulator this should connect you, otherwise, type /console (IP address shown in-game) to continue.")
     else:
         logger.info(f"Attempting to connect to the console (using last used IP address {ctx.wii_ip}); if your console's IP address has changed, type /console (new IP address shown in-game) to continue.")
+
+    lvl = ctx.ingame_verbosity
+    if lvl == VerbosityLevel.Nothing:
+        logger.info("Msg forwarding set to None, so no client messages will appear in-game.")
+    elif lvl == VerbosityLevel.ItemsChat:
+            logger.info("Msg forwarding set to Low, so items sent to/received from this slot will appear in-game.")
+    elif lvl == VerbosityLevel.ItemsChat:
+        logger.info("Msg forwarding set to Medium, so chat messages & items sent to/received from this slot will appear in-game.")
+    elif lvl == VerbosityLevel.ItemsChatJoins:
+        logger.info("Msg forwarding set to High, so chat messages, items sent to/received from this slot, & players joining/leaving will appear in-game.")
+    elif lvl == VerbosityLevel.All:
+        logger.info("Msg forwarding set to All, so all client messages will appear in-game.")
+    logger.info("You may change this with the /msg_forwarding command.")
     while not ctx.exit_event.is_set():
         try:
             if ctx.is_hooked():

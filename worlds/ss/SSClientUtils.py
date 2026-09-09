@@ -17,7 +17,7 @@ BEEDLE_CHECKS = (
 CLIENT_TEXT_BUFFER_SIZE = 1000 # actually 1024 but the recv buffer isn't that big
 
 # Time for a client message to disappear in-game (in seconds, not including stagger time for multiple lines in the queue)
-CLIENT_TEXT_TIMEOUT = 6
+CLIENT_TEXT_TIMEOUT = 10
 
 # Max number of characters in a line for in-game client text
 INGAME_LINE_LENGTH = 64
